@@ -7,6 +7,7 @@ Import a voice recording or gameplay audio, pick a character, and Animator moves
 ## Features
 
 - **Lip-sync from audio:** MP3, WAV, M4A, OGG, FLAC and more. Mouth shapes for open, wide, round and closed sounds.
+- **Long recordings:** MP3 and WAV files of any length are read a piece at a time (tested with a 2-hour, 270 MB MP3). Videos longer than 20 minutes are written straight into a file you choose.
 - **Voice focus:** ignores steady game sounds and music, or load a separate voice-only track.
 - **Your own characters:** import an SVG drawing, or an HTML model file that plays its own animation.
 - **Fast export:** encodes on your graphics card, much faster than real time, with a timer and time left.
@@ -18,6 +19,8 @@ Import a voice recording or gameplay audio, pick a character, and Animator moves
 Open the site's GitHub Pages address in **Chrome** or **Edge** (Firefox and Safari can play and preview, but fast export needs Chrome or Edge).
 
 To install it: click **Install app** in the top bar, or the install icon in the browser's address bar.
+
+If the export panel says **No graphics card in use**, the browser is drawing in software and exports run on the processor. The panel lists the fixes (usually a missing graphics driver, or running over Remote Desktop or in a virtual machine).
 
 ## Make your own character
 
@@ -41,6 +44,10 @@ Imported models are saved in your browser on that computer only.
 2. Go to **Settings → Pages**.
 3. Under **Build and deployment**, set **Source** to **Deploy from a branch**, choose **main** and **/ (root)**, then **Save**.
 4. After a minute, your site is live at `https://<your-username>.github.io/<repository-name>/`.
+
+## Update your copy
+
+Upload the new files over the old ones (same names, same folders) and commit. Visitors who already opened Animator see "A new version of Animator is ready" on their next visit, and get it when they reload.
 
 ## Credits
 

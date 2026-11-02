@@ -132,6 +132,9 @@ input[type=range]:disabled{opacity:.45}
 .trow .lbl{font-size:12px; color:var(--muted); margin-right:10px}
 .tmode{font-size:12.5px; color:var(--muted)}
 .lastexp{font-size:12.5px; color:var(--ink); padding:8px 10px; border-left:3px solid var(--accent); background:var(--soft); border-radius:0 8px 8px 0}
+#gpuInfo.warn{display:flex; flex-direction:column; gap:6px; color:var(--ink); background:color-mix(in srgb, var(--vA) 14%, var(--panel));
+  border:1px solid color-mix(in srgb, var(--vA) 55%, transparent); border-radius:10px; padding:10px 12px}
+#gpuInfo.warn ol{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4px}
 .progress{height:6px; background:var(--soft); border-radius:99px; overflow:hidden}
 .progress i{display:block; height:100%; width:0; background:var(--accent)}
 .status{font-size:12.5px; color:var(--muted); min-height:1.4em}
@@ -522,12 +525,20 @@ input[type=range]:disabled{opacity:.45}
 const $ = id => document.getElementById(id);
 const FPS = 60;
 let track = null, ctx = null, mediaSrc = null, speaker = null, recording = false;
-// Plays the decoded audio straight through Web Audio (no <audio> element, no blob URL).
+// Plays audio through Web Audio: a decoded buffer for normal files, or the browser's own
+// player streaming from the file for long recordings that don't fit in memory.
 const audio = (() => {
   const ev = {}; let buffer = null, node = null, startAt = 0, offset = 0, playing = false, ended = false;
+  let el = null, elSrc = null, elUrl = null;
   const emit = n => (ev[n] || []).slice().forEach(f => f());
-  const dur = () => buffer ? buffer.duration : 0;
+  const dur = () => el ? (isFinite(el.duration) ? el.duration : (track ? track.duration : 0)) : buffer ? buffer.duration : 0;
   const stopNode = () => { if (node){ node.onended = null; try { node.stop(); } catch(e){} node.disconnect(); node = null; } };
+  const dropEl = () => {
+    if (!el) return;
+    el.pause(); try { elSrc.disconnect(); } catch(e){}
+    el.removeAttribute('src'); try { el.load(); } catch(e){}
+    URL.revokeObjectURL(elUrl); el = elSrc = elUrl = null;
+  };
   function start(t){
     node = ctx.createBufferSource(); node.buffer = buffer; node.connect(mediaSrc);
     node.start(0, t); startAt = ctx.currentTime - t;
@@ -537,19 +548,42 @@ const audio = (() => {
   const p = {
     addEventListener(n, f, o){ (ev[n] = ev[n] || []).push(o && o.once ? function g(){ ev[n] = ev[n].filter(x => x !== g); f(); } : f); },
     removeEventListener(n, f){ if (ev[n]) ev[n] = ev[n].filter(x => x !== f); },
-    get paused(){ return !playing; },
-    get buffer(){ return buffer; },
-    get ended(){ return ended; },
-    get currentTime(){ return playing ? Math.min(dur(), ctx.currentTime - startAt) : offset; },
-    set currentTime(t){ t = Math.max(0, Math.min(dur(), t)); ended = false; if (playing){ stopNode(); start(t); } else offset = t; },
-    set buffer(b){ p.pause(); buffer = b; offset = 0; ended = false; },
+    get paused(){ return el ? el.paused : !playing; },
+    get buffer(){ return el ? null : buffer; },
+    get ended(){ return el ? el.ended : ended; },
+    get currentTime(){ return el ? el.currentTime : playing ? Math.min(dur(), ctx.currentTime - startAt) : offset; },
+    set currentTime(t){
+      t = Math.max(0, Math.min(dur(), t));
+      if (el){ try { el.currentTime = t; } catch(e){} return; }
+      ended = false; if (playing){ stopNode(); start(t); } else offset = t;
+    },
+    set buffer(b){ p.pause(); dropEl(); buffer = b; offset = 0; ended = false; },
+    // long recordings: play straight from the file; resolves true once the browser can play it
+    setFile(file){
+      p.pause(); dropEl(); buffer = null; offset = 0; ended = false;
+      ensureCtx();
+      el = new Audio(); el.preload = 'auto';
+      elUrl = URL.createObjectURL(file); el.src = elUrl;
+      elSrc = ctx.createMediaElementSource(el); elSrc.connect(mediaSrc);
+      ['play', 'pause', 'ended'].forEach(n => el.addEventListener(n, () => emit(n)));
+      const me = el;
+      return new Promise(res => {
+        me.addEventListener('loadedmetadata', () => res(true), { once: true });
+        me.addEventListener('error', () => res(false), { once: true });
+        setTimeout(() => res(false), 20000);
+      });
+    },
     async play(){
-      if (!buffer || playing) return;
       ensureCtx(); if (ctx.state !== 'running') await ctx.resume();
+      if (el){ if (el.ended) el.currentTime = 0; await el.play(); return; }
+      if (!buffer || playing) return;
       if (offset >= dur() - 0.01) offset = 0;
       ended = false; start(offset); playing = true; emit('play');
     },
-    pause(){ if (!playing) return; offset = p.currentTime; playing = false; stopNode(); emit('pause'); }
+    pause(){
+      if (el){ el.pause(); return; }
+      if (!playing) return; offset = p.currentTime; playing = false; stopNode(); emit('pause');
+    }
   };
   return p;
 })();
@@ -575,55 +609,183 @@ function ensureCtx(){
 /* ---------- analysis ---------- */
 function pct(arr, p){ if(!arr.length) return 0; const s = Float32Array.from(arr).sort(); return s[Math.min(s.length-1, Math.floor(p*s.length))]; }
 
-// One pass over the samples: overall level, a speaking-voice band (about 250-3400 Hz),
-// and the tone balance used to pick mouth shapes. No full-length copies, so long recordings fit in memory.
-async function analyze(buf){
-  const sr = buf.sampleRate, len = buf.length, ch = buf.numberOfChannels;
-  const D = []; for (let c = 0; c < ch; c++) D.push(buf.getChannelData(c));
-  const hop = sr/FPS, N = Math.ceil(len/hop);
-  const E = new Float64Array(N+1), EL = new Float64Array(N+1), EH = new Float64Array(N+1), EV = new Float64Array(N+1);
-  const co = fc => 1 - Math.exp(-2*Math.PI*fc/sr);
+// Streaming analysis: samples go in a piece at a time and only per-frame measurements are kept,
+// so hours of audio never have to fit in memory. Measures overall level, a speaking-voice band
+// (about 250-3400 Hz) and the tone balance used to pick mouth shapes.
+function makeAnalyzer(sr){
+  const hop = sr/FPS, co = fc => 1 - Math.exp(-2*Math.PI*fc/sr);
   const aL = co(1000), aH = co(3000), a1 = co(250), a2 = co(3400);
-  const peaks = new Float32Array(3000), per = len/peaks.length;
-  let sL = 0, sH = 0, s1 = 0, s2 = 0;
-  const STEP = 4000000;
-  for (let i0 = 0; i0 < len; i0 += STEP){
-    const i1 = Math.min(len, i0 + STEP);
-    for (let i = i0; i < i1; i++){
-      let v = D[0][i]; if (ch > 1){ for (let c = 1; c < ch; c++) v += D[c][i]; v /= ch; }
-      sL += aL*(v - sL); sH += aH*(v - sH); s1 += a1*(v - s1); s2 += a2*(v - s2);
-      const h = v - sH, bp = s2 - s1, k = (i/hop)|0;
-      E[k] += v*v; EL[k] += sL*sL; EH[k] += h*h; EV[k] += bp*bp;
-      const av = v < 0 ? -v : v, pk = (i/per)|0; if (av > peaks[pk]) peaks[pk] = av;
+  let sL = 0, sH = 0, s1 = 0, s2 = 0, pos = 0, cap = 1 << 15;
+  let E = new Float64Array(cap), EL = new Float64Array(cap), EH = new Float64Array(cap), EV = new Float64Array(cap), PK = new Float32Array(cap);
+  const grow = k => {
+    if (k < cap) return;
+    let nc = cap; while (nc <= k) nc *= 2;
+    const g = (A, T) => { const b = new T(nc); b.set(A); return b; };
+    E = g(E, Float64Array); EL = g(EL, Float64Array); EH = g(EH, Float64Array); EV = g(EV, Float64Array); PK = g(PK, Float32Array); cap = nc;
+  };
+  return {
+    feed(m){
+      grow(Math.ceil((pos + m.length) / hop) + 1);
+      for (let j = 0; j < m.length; j++){
+        const v = m[j];
+        sL += aL*(v - sL); sH += aH*(v - sH); s1 += a1*(v - s1); s2 += a2*(v - s2);
+        const h = v - sH, bp = s2 - s1, k = ((pos + j) / hop) | 0;
+        E[k] += v*v; EL[k] += sL*sL; EH[k] += h*h; EV[k] += bp*bp;
+        const av = v < 0 ? -v : v; if (av > PK[k]) PK[k] = av;
+      }
+      pos += m.length;
+    },
+    finish(){
+      const len = pos, N = Math.max(1, Math.ceil(len / hop));
+      const rms = new Float32Array(N), rv = new Float32Array(N), low = new Float32Array(N), hi = new Float32Array(N);
+      const n3 = hop*3;
+      for (let i = 0; i < N; i++){
+        const a = Math.max(0, i-1), b = Math.min(N-1, i+1);
+        let s = 0, sl = 0, sh = 0, sv = 0;
+        for (let k = a; k <= b; k++){ s += E[k]; sl += EL[k]; sh += EH[k]; sv += EV[k]; }
+        rms[i] = Math.sqrt(s/n3); rv[i] = Math.sqrt(sv/n3);
+        low[i] = s > 0 ? Math.sqrt(sl/s) : 0; hi[i] = s > 0 ? Math.sqrt(sh/s) : 0;
+      }
+      let mx = 0, mv = 0; for (let i = 0; i < N; i++){ if (rms[i] > mx) mx = rms[i]; if (rv[i] > mv) mv = rv[i]; }
+      const step = Math.max(1, Math.floor(N/200000));
+      const voiced = [], vVo = [], vl = [], vh = [];
+      for (let i = 0; i < N; i += step) if (rms[i] > mx*0.08){ voiced.push(rms[i]); vVo.push(rv[i]); vl.push(low[i]); vh.push(hi[i]); }
+      const ref = pct(voiced, 0.9) || mx || 1, refV = pct(vVo, 0.9) || mv || 1;
+      const lev = new Float32Array(N), levV = new Float32Array(N);
+      for (let i = 0; i < N; i++){ lev[i] = Math.min(1.6, rms[i]/ref); levV[i] = Math.min(2, rv[i]/refV); }
+      // background level: median of quarter-second minimums over about 5 seconds
+      const BL = 15, nb = Math.ceil(N/BL), bmin = new Float32Array(nb);
+      for (let b = 0; b < nb; b++){ let m = Infinity; for (let i = b*BL; i < Math.min(N, (b+1)*BL); i++) if (levV[i] < m) m = levV[i]; bmin[b] = m === Infinity ? 0 : m; }
+      const bfl = new Float32Array(nb), tmp = [];
+      for (let b = 0; b < nb; b++){ tmp.length = 0; for (let k = Math.max(0, b-10); k <= Math.min(nb-1, b+10); k++) tmp.push(bmin[k]); tmp.sort((x, y) => x - y); bfl[b] = tmp[tmp.length >> 1]; }
+      const floorV = new Float32Array(N);
+      for (let i = 0; i < N; i++){ const f = i/BL - 0.5, b0 = Math.max(0, Math.floor(f)), b1 = Math.min(nb-1, b0+1), t = clamp(f - b0, 0, 1); floorV[i] = bfl[b0]*(1-t) + bfl[b1]*t; }
+      const peaks = new Float32Array(3000), per = N / peaks.length;
+      for (let k = 0; k < peaks.length; k++){
+        const a = Math.floor(k*per), b = Math.min(N, Math.max(a+1, Math.floor((k+1)*per)));
+        let m = 0; for (let i = a; i < b; i++) if (PK[i] > m) m = PK[i]; peaks[k] = m;
+      }
+      let pm = 0; for (const v of peaks) pm = Math.max(pm, v);
+      E = EL = EH = EV = PK = null;
+      return { duration: len/sr, N, lev, levV, floorV, low, hi, peaks, peakMax: pm || 1, norm: {},
+        th: { oLow: pct(vl, 0.8), eLow: pct(vl, 0.2), eHi: Math.max(0.18, pct(vh, 0.85)) } };
     }
-    if (len > STEP*2){ setStatus('Analyzing… ' + Math.round(i1/len*100) + '%'); await new Promise(r => setTimeout(r, 0)); }
+  };
+}
+const toMono = (chans, n) => {
+  if (chans.length === 1) return chans[0].length === n ? chans[0] : chans[0].subarray(0, n);
+  const m = new Float32Array(n), k = 1 / chans.length;
+  for (const d of chans) for (let i = 0; i < n; i++) m[i] += d[i] * k;
+  return m;
+};
+async function analyze(buf){
+  const an = makeAnalyzer(buf.sampleRate), len = buf.length, S = 1 << 20;
+  const D = []; for (let c = 0; c < buf.numberOfChannels; c++) D.push(buf.getChannelData(c));
+  for (let o = 0; o < len; o += S){
+    const n = Math.min(S, len - o);
+    an.feed(toMono(D.map(d => d.subarray(o, o + n)), n));
+    if (len > S*4){ setStatus('Analyzing… ' + Math.round((o + n)/len*100) + '%'); await new Promise(r => setTimeout(r, 0)); }
   }
-  const rms = new Float32Array(N), rv = new Float32Array(N), low = new Float32Array(N), hi = new Float32Array(N);
-  const n3 = hop*3;
-  for (let i = 0; i < N; i++){
-    const a = Math.max(0, i-1), b = Math.min(N-1, i+1);
-    let s = 0, sl = 0, sh = 0, sv = 0;
-    for (let k = a; k <= b; k++){ s += E[k]; sl += EL[k]; sh += EH[k]; sv += EV[k]; }
-    rms[i] = Math.sqrt(s/n3); rv[i] = Math.sqrt(sv/n3);
-    low[i] = s > 0 ? Math.sqrt(sl/s) : 0; hi[i] = s > 0 ? Math.sqrt(sh/s) : 0;
+  return an.finish();
+}
+
+/* Audio read a piece at a time, straight from the file (MP3 and WAV), or from a decoded buffer. */
+const MPG_URL = 'vendor/mpg123-decoder.min.js';
+async function* mp3Chunks(file, onProgress){
+  await loadScript(MPG_URL);
+  const dec = new window['mpg123-decoder'].MPEGDecoder();
+  await dec.ready;
+  const CH = 1 << 20;
+  try {
+    for (let o = 0; o < file.size; o += CH){
+      const u8 = new Uint8Array(await file.slice(o, Math.min(file.size, o + CH)).arrayBuffer());
+      const r = dec.decode(u8);
+      if (onProgress) onProgress(Math.min(1, (o + CH) / file.size));
+      if (r.samplesDecoded) yield { sr: r.sampleRate, n: r.samplesDecoded, chans: r.channelData.map(d => d.slice(0, r.samplesDecoded)) };
+    }
+  } finally { dec.free(); }
+}
+async function* wavChunks(file, onProgress){
+  const head = new DataView(await file.slice(0, Math.min(file.size, 1 << 20)).arrayBuffer());
+  const str = (p, n) => { let t = ''; for (let i = 0; i < n; i++) t += String.fromCharCode(head.getUint8(p + i)); return t; };
+  let p = 12, fmt = null, dataOff = 0, dataLen = 0;
+  while (p + 8 <= head.byteLength){
+    const id = str(p, 4), sz = head.getUint32(p + 4, true);
+    if (id === 'fmt '){
+      fmt = { tag: head.getUint16(p + 8, true), ch: head.getUint16(p + 10, true), sr: head.getUint32(p + 12, true), bits: head.getUint16(p + 22, true) };
+      if (fmt.tag === 0xFFFE && sz >= 26) fmt.tag = head.getUint16(p + 32, true);
+    }
+    if (id === 'data'){ dataOff = p + 8; dataLen = (sz === 0 || sz === 0xFFFFFFFF) ? file.size - dataOff : Math.min(sz, file.size - dataOff); break; }
+    p += 8 + sz + (sz & 1);
   }
-  let mx = 0, mv = 0; for (let i = 0; i < N; i++){ if (rms[i] > mx) mx = rms[i]; if (rv[i] > mv) mv = rv[i]; }
-  const step = Math.max(1, Math.floor(N/200000));
-  const voiced = [], vVo = [], vl = [], vh = [];
-  for (let i = 0; i < N; i += step) if (rms[i] > mx*0.08){ voiced.push(rms[i]); vVo.push(rv[i]); vl.push(low[i]); vh.push(hi[i]); }
-  const ref = pct(voiced, 0.9) || mx || 1, refV = pct(vVo, 0.9) || mv || 1;
-  const lev = new Float32Array(N), levV = new Float32Array(N);
-  for (let i = 0; i < N; i++){ lev[i] = Math.min(1.6, rms[i]/ref); levV[i] = Math.min(2, rv[i]/refV); }
-  // background level: median of quarter-second minimums over about 5 seconds
-  const BL = 15, nb = Math.ceil(N/BL), bmin = new Float32Array(nb);
-  for (let b = 0; b < nb; b++){ let m = Infinity; for (let i = b*BL; i < Math.min(N, (b+1)*BL); i++) if (levV[i] < m) m = levV[i]; bmin[b] = m === Infinity ? 0 : m; }
-  const bfl = new Float32Array(nb), tmp = [];
-  for (let b = 0; b < nb; b++){ tmp.length = 0; for (let k = Math.max(0, b-10); k <= Math.min(nb-1, b+10); k++) tmp.push(bmin[k]); tmp.sort((x, y) => x - y); bfl[b] = tmp[tmp.length >> 1]; }
-  const floorV = new Float32Array(N);
-  for (let i = 0; i < N; i++){ const f = i/BL - 0.5, b0 = Math.max(0, Math.floor(f)), b1 = Math.min(nb-1, b0+1), t = clamp(f - b0, 0, 1); floorV[i] = bfl[b0]*(1-t) + bfl[b1]*t; }
-  let pm = 0; for (const v of peaks) pm = Math.max(pm, v);
-  return { duration: len/sr, N, lev, levV, floorV, low, hi, peaks, peakMax: pm || 1, norm: {},
-    th: { oLow: pct(vl, 0.8), eLow: pct(vl, 0.2), eHi: Math.max(0.18, pct(vh, 0.85)) } };
+  if (!fmt || !dataOff) throw new Error('no audio data found in this WAV file');
+  if (!((fmt.tag === 1 && [8, 16, 24, 32].includes(fmt.bits)) || (fmt.tag === 3 && fmt.bits === 32))) throw new Error('this WAV format (' + fmt.bits + '-bit, type ' + fmt.tag + ') is not supported');
+  const bps = fmt.bits / 8, frame = bps * fmt.ch, CHF = 262144;
+  for (let o = 0; o < dataLen; o += CHF * frame){
+    let len = Math.min(CHF * frame, dataLen - o); len -= len % frame; if (!len) break;
+    const dv = new DataView(await file.slice(dataOff + o, dataOff + o + len).arrayBuffer());
+    const n = len / frame, chans = []; for (let c = 0; c < fmt.ch; c++) chans.push(new Float32Array(n));
+    for (let i = 0, q = 0; i < n; i++) for (let c = 0; c < fmt.ch; c++, q += bps){
+      let v;
+      if (fmt.tag === 3) v = dv.getFloat32(q, true);
+      else if (bps === 2) v = dv.getInt16(q, true) / 32768;
+      else if (bps === 1) v = (dv.getUint8(q) - 128) / 128;
+      else if (bps === 3){ const x = dv.getUint8(q) | (dv.getUint8(q + 1) << 8) | (dv.getInt8(q + 2) << 16); v = x / 8388608; }
+      else v = dv.getInt32(q, true) / 2147483648;
+      chans[c][i] = v;
+    }
+    if (onProgress) onProgress(Math.min(1, (o + len) / dataLen));
+    yield { sr: fmt.sr, n, chans };
+  }
+}
+async function* bufferChunks(buf){
+  const S = 1 << 18, D = []; for (let c = 0; c < buf.numberOfChannels; c++) D.push(buf.getChannelData(c));
+  for (let o = 0; o < buf.length; o += S){ const n = Math.min(S, buf.length - o); yield { sr: buf.sampleRate, n, chans: D.map(d => d.subarray(o, o + n)) }; }
+}
+const pcmChunks = (file, kind, onProgress) => kind === 'WAV' ? wavChunks(file, onProgress) : mp3Chunks(file, onProgress);
+// Pulls exact-sized blocks from a chunk stream, with the channel count wanted, resampled if needed.
+function makePcmReader(gen, ch, outSr){
+  let cur = null, pos = 0, done = false;
+  const next = async () => {
+    const r = await gen.next();
+    if (r.done){ done = true; cur = null; return false; }
+    const c = r.value, chans = [];
+    for (let k = 0; k < ch; k++) chans.push(c.chans[Math.min(k, c.chans.length - 1)]);
+    cur = { sr: c.sr, n: c.n, chans }; return true;
+  };
+  return {
+    async read(want){
+      if (done) return null;
+      if (!cur && !(await next())) return null;
+      const out = []; for (let k = 0; k < ch; k++) out.push(new Float32Array(want));
+      let i = 0;
+      while (i < want){
+        const step = cur.sr / outSr, lim = step === 1 ? cur.n : cur.n - 1;
+        if (pos >= lim){ pos = Math.max(0, pos - lim); if (!(await next())) break; continue; }
+        if (step === 1){
+          const take = Math.min(want - i, cur.n - pos);
+          for (let k = 0; k < ch; k++) out[k].set(cur.chans[k].subarray(pos, pos + take), i);
+          i += take; pos += take;
+        } else {
+          const p0 = Math.floor(pos), fr = pos - p0;
+          for (let k = 0; k < ch; k++){ const d = cur.chans[k]; out[k][i] = d[p0]*(1 - fr) + d[p0 + 1]*fr; }
+          i++; pos += step;
+        }
+      }
+      if (!i) return null;
+      return { n: i, chans: i < want ? out.map(a => a.subarray(0, i)) : out };
+    }
+  };
+}
+async function analyzeStream(file, kind, label){
+  let an = null, sr = 0, ch = 0, last = 0;
+  const prog = p => { const now = performance.now(); if (now - last > 250){ last = now; setStatus(label + ' ' + Math.round(p*100) + '%'); } };
+  for await (const ck of pcmChunks(file, kind, prog)){
+    if (!an){ an = makeAnalyzer(ck.sr); sr = ck.sr; ch = ck.chans.length; }
+    an.feed(toMono(ck.chans, ck.n));
+  }
+  if (!an) throw new Error('no audio found in the file');
+  return Object.assign(an.finish(), { sr, ch });
 }
 
 // mouth drive signal: plain loudness, or voice-band level rising above the background
@@ -702,69 +864,68 @@ function sniff(u){
 function loadScript(src){
   return new Promise((res, rej) => {
     if (document.querySelector('script[src="'+src+'"]')) return res();
-    const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('could not load the backup decoder'));
+    const el = document.createElement('script'); el.charset = 'utf-8'; el.src = src; el.onload = res; el.onerror = () => rej(new Error('could not load the backup decoder'));
     document.head.appendChild(el);
   });
 }
-// Backup decoder for MP3s the browser refuses (odd encoders, very long recordings). Decodes in chunks to mono.
-async function decodeMp3(u8){
-  await loadScript('vendor/mpg123-decoder.min.js');
-  const dec = new window['mpg123-decoder'].MPEGDecoder();
-  await dec.ready;
-  const parts = []; let total = 0, sr = 0;
-  const CH = 1 << 19;
-  try {
-    for (let o = 0, k = 0; o < u8.length; o += CH, k++){
-      const r = dec.decode(u8.subarray(o, Math.min(u8.length, o + CH)));
-      if (r.samplesDecoded){
-        sr = r.sampleRate; const cd = r.channelData, n = r.samplesDecoded, m = new Float32Array(n);
-        for (let c = 0; c < cd.length; c++){ const d = cd[c]; for (let i = 0; i < n; i++) m[i] += d[i] / cd.length; }
-        parts.push(m); total += n;
-      }
-      if (k % 16 === 15){ setStatus('Decoding MP3… ' + Math.round(o / u8.length * 100) + '%'); await new Promise(r => setTimeout(r, 0)); }
-    }
-  } finally { dec.free(); }
-  if (!total || !sr) throw new Error('no MP3 audio frames found');
-  const out = ctx.createBuffer(1, total, sr), d = out.getChannelData(0);
-  let off = 0; for (const p of parts){ d.set(p, off); off += p.length; }
-  return out;
+const MB = 1048576;
+async function fileKind(file){ return sniff(new Uint8Array(await file.slice(0, 64).arrayBuffer())); }
+// Long MP3 and WAV files are read a piece at a time instead of being decoded into memory all at once.
+const shouldStream = (kind, size) => (kind === 'MP3' && size > 25*MB) || (kind === 'WAV' && size > 150*MB);
+const canStream = kind => kind === 'MP3' || kind === 'WAV';
+function kindError(file, kind){
+  const mb = (file.size/MB).toFixed(1) + ' MB', ext = (file.name.split('.').pop() || 'audio').toUpperCase();
+  if (kind === 'HTML') return 'it is a saved web page, not audio';
+  if (kind !== 'unknown' && kind !== 'MP3' && !/\.(m4a|mp4|wav|ogg|webm|flac|aac|mkv|mov)$/i.test(file.name)) return 'it contains ' + kind + ' data, not ' + ext + ', ' + mb;
+  return null;
 }
-
 async function decodeFile(file){
   const ab = await file.arrayBuffer();
-  const kind = sniff(new Uint8Array(ab, 0, Math.min(ab.byteLength, 64)));
   ensureCtx();
-  let buf = null, nativeErr = null;
-  try {
-    buf = await new Promise((res, rej) => { const p = ctx.decodeAudioData(ab.slice(0), res, rej); if (p && p.then) p.then(res, rej); });
-  } catch (e1) { nativeErr = e1; }
-  if (!buf && (kind === 'MP3' || kind === 'unknown')){
-    setStatus('Using the backup MP3 decoder for ' + file.name + '…');
-    try { buf = await decodeMp3(new Uint8Array(ab)); } catch (e2) { console.error(e2); }
-  }
-  if (!buf){
-    const mb = (file.size/1048576).toFixed(1) + ' MB';
-    if (kind !== 'MP3' && kind !== 'unknown' && !/\.(m4a|mp4|wav|ogg|webm|flac|aac)$/i.test(file.name) )
-      throw new Error((kind === 'HTML' ? 'it is a saved web page, not audio' : 'it contains ' + kind + ' data, not ' + (file.name.split('.').pop() || 'audio').toUpperCase()) + ', ' + mb);
-    throw new Error(((nativeErr && nativeErr.message) || 'decode error') + ', ' + kind + ', ' + mb);
-  }
-  return buf;
+  return await new Promise((res, rej) => { const p = ctx.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
 }
 
 async function importFile(file){
   if (!file) return;
   if (recording){ busyMsg(); return; }
-  setStatus('Analyzing ' + file.name + '…');
+  setStatus('Opening ' + file.name + '…');
   await new Promise(r => setTimeout(r, 30));
+  let kind = 'unknown';
   try {
-    const buf = await decodeFile(file);
+    kind = await fileKind(file);
+    const bad = kindError(file, kind); if (bad) throw new Error(bad);
+    if (canStream(kind) && shouldStream(kind, file.size)) return await loadStream(file, kind);
+    let buf;
+    try { buf = await decodeFile(file); }
+    catch (e1) {
+      if (canStream(kind)) return await loadStream(file, kind);
+      throw e1;
+    }
     await loadBuffer(buf, file.name, false);
     setStatus('Loaded ' + fmt(buf.duration) + ' of audio. Press play to preview.');
   } catch (e) {
     console.error(e);
-    setStatus("Couldn't read " + file.name + ' (' + ((e && (e.message || e.name)) || 'decode error') + '). Try exporting it again as WAV or M4A.');
+    const long = file.size > 100*MB && !canStream(kind);
+    setStatus("Couldn't read " + file.name + ' (' + ((e && (e.message || e.name)) || 'decode error') + ', ' + (file.size/MB).toFixed(1) + ' MB). ' +
+      (long ? 'Long recordings work best as MP3 or WAV, which Animator reads a piece at a time.' : 'Try saving it as MP3 or WAV.'));
   }
 }
+async function loadStream(file, kind){
+  const a = await analyzeStream(file, kind, 'Reading ' + file.name + '…');
+  setVoiceLabel(null);
+  track = Object.assign(a, { name: file.name, file, kind, stream: true });
+  $('fileName').textContent = file.name;
+  $('fileTag').textContent = 'Audio';
+  $('dur').textContent = fmt(a.duration);
+  recompute(); updatePlayIcon();
+  setStatus('Checking playback…');
+  const playable = await audio.setFile(file);
+  updatePlayIcon();
+  setStatus('Loaded ' + fmtLong(a.duration) + ' of audio, read in pieces so long recordings fit.' +
+    (playable ? ' Press play to preview.' : " This browser can't preview it, but fast export still works."));
+}
+const fmtLong = sec => { const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s2 = Math.floor(sec%60);
+  return h ? h + ' h ' + m + ' min' : m ? m + ' min ' + s2 + ' s' : s2 + ' s'; };
 
 /* optional voice-only track that drives the mouth while the full mix plays */
 function setVoiceLabel(name){
@@ -779,11 +940,17 @@ async function importVoice(file){
   setStatus('Analyzing voice track ' + file.name + '…');
   await new Promise(r => setTimeout(r, 30));
   try {
-    const buf = await decodeFile(file);
-    track.voice = await analyze(buf);
+    const kind = await fileKind(file);
+    let v;
+    if (canStream(kind) && shouldStream(kind, file.size)) v = await analyzeStream(file, kind, 'Reading voice track…');
+    else {
+      try { v = await analyze(await decodeFile(file)); }
+      catch (e1) { if (!canStream(kind)) throw e1; v = await analyzeStream(file, kind, 'Reading voice track…'); }
+    }
+    track.voice = v;
     setVoiceLabel(file.name);
     recompute();
-    const diff = Math.abs(buf.duration - track.duration);
+    const diff = Math.abs(v.duration - track.duration);
     setStatus('The mouth now follows ' + file.name + '.' + (diff > 1 ? ' Its length differs from the main audio by ' + diff.toFixed(1) + ' s, so check that both start at the same moment.' : ''));
   } catch (e) {
     console.error(e);
@@ -1579,13 +1746,14 @@ async function fastExport(opts){
   opts = opts || {};
   const job = fastJob = { cancel: false };
   const fps = 30, [W, H] = radio('size').split('x').map(Number);
-  let abuf = audio.buffer;
+  const abuf = audio.buffer;
   const dur = track.duration, F = Math.ceil(dur * fps);
   audio.pause();
   setRecUI(true);
   $('recTime').textContent = 'EXPORT';
   setStatus('Preparing fast export…');
-  let vencs = [], aenc;
+  let vencs = [], aenc, writable = null;
+  const dropFile = async () => { if (writable){ const w = writable; writable = null; try { await w.abort(); } catch(e){} } };
   try {
     await loadScript(MUXER_URL);
     const vbit = dur > 600 ? 2500000 : 5000000;
@@ -1594,10 +1762,13 @@ async function fastExport(opts){
     const ENC = { 'prefer-hardware': 'graphics card', 'prefer-software': 'processor', 'no-preference': 'automatic encoder' };
     const encUsed = ENC[vcfg.hardwareAcceleration];
     const encNote = opts.software ? '' : vcfg.hardwareAcceleration !== $('encoderPref').value ? " (the " + ENC[$('encoderPref').value] + " encoder isn't available)" : '';
-    let ch = Math.min(2, abuf.numberOfChannels), acfg = await pickAudioConfig(abuf.sampleRate, ch);
-    if (!acfg){ abuf = await to48k(abuf); ch = abuf.numberOfChannels; acfg = await pickAudioConfig(48000, ch); }
+    // audio comes from the decoded buffer, or straight from the file a piece at a time for long recordings
+    const inSr = track.stream ? track.sr : abuf.sampleRate, inCh = track.stream ? track.ch : abuf.numberOfChannels;
+    const ch = Math.min(2, inCh);
+    let sr = inSr, acfg = await pickAudioConfig(sr, ch);
+    if (!acfg){ sr = 48000; acfg = await pickAudioConfig(sr, ch); }
     if (!acfg) throw new Error('this browser has no audio encoder for MP4');
-    const sr = abuf.sampleRate;
+    const pcm = makePcmReader(track.stream ? pcmChunks(track.file, track.kind) : bufferChunks(abuf), ch, sr);
 
     // How frames get drawn: straight from the shapes when the model allows it, otherwise through an image.
     const comp = (!live && svgEl) ? compileShapes(svgEl) : null;
@@ -1608,12 +1779,15 @@ async function fastExport(opts){
     const cores = navigator.hardwareConcurrency || 4;
     const K = opts.single || !comp ? 1 : (window.__encoders || Math.max(1, Math.min(4, vcfg.hardwareAcceleration === 'prefer-hardware' ? (cores >= 4 ? 3 : 2) : Math.floor(cores / 2))));
 
-    const big = (vbit + 128000) / 8 * dur > 1.2e9, parts = [];
+    // Where the video goes: straight into the file you chose (long videos), or memory until it's saved.
+    if (opts.fileHandle && !writable) writable = await opts.fileHandle.createWritable();
+    const big = !writable && (vbit + 128000) / 8 * dur > 1.2e9, parts = [];
     let pend = [], pendBytes = 0;
-    const target = big ? new Mp4Muxer.StreamTarget({ onData: data => { pend.push(data.slice()); pendBytes += data.byteLength;
+    const target = writable ? new Mp4Muxer.FileSystemWritableFileStreamTarget(writable, { chunkSize: 16*1048576 })
+                 : big ? new Mp4Muxer.StreamTarget({ onData: data => { pend.push(data.slice()); pendBytes += data.byteLength;
                             if (pendBytes > 64*1048576){ parts.push(new Blob(pend)); pend = []; pendBytes = 0; } } })
-                       : new Mp4Muxer.ArrayBufferTarget();
-    const muxer = new Mp4Muxer.Muxer({ target, fastStart: big ? 'fragmented' : 'in-memory', firstTimestampBehavior: 'offset',
+                 : new Mp4Muxer.ArrayBufferTarget();
+    const muxer = new Mp4Muxer.Muxer({ target, fastStart: writable ? false : big ? 'fragmented' : 'in-memory', firstTimestampBehavior: 'offset',
       video: { codec: 'avc', width: W, height: H, frameRate: fps }, audio: { codec: acfg.mux, numberOfChannels: ch, sampleRate: sr } });
     let encErr = null;
     const stores = [], wakes = [], probe = []; let probeCfg = null;
@@ -1634,15 +1808,17 @@ async function fastExport(opts){
       enc.ondequeue = () => { const wk = wakes[k]; if (wk){ wakes[k] = null; wk(); } };
       vencs.push(enc);
     }
-    const chans = []; for (let c = 0; c < ch; c++) chans.push(abuf.getChannelData(c));
-    let aPos = 0;
-    const encodeAudioUntil = upto => {
-      const end = Math.min(abuf.length, Math.ceil(upto * sr));
-      while (aPos < end){
-        const n = Math.min(4096, end - aPos), data = new Float32Array(n * ch);
-        for (let c = 0; c < ch; c++) data.set(chans[c].subarray(aPos, aPos + n), c * n);
+    let aPos = 0, aDone = false;
+    const encodeAudioUntil = async upto => {
+      const end = Math.ceil(upto * sr);
+      while (!aDone && aPos < end){
+        const blk = await pcm.read(Math.min(4096, end - aPos));
+        if (!blk){ aDone = true; break; }
+        const n = blk.n, data = new Float32Array(n * ch);
+        for (let c = 0; c < ch; c++) data.set(blk.chans[c], c * n);
         const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: n, numberOfChannels: ch, timestamp: Math.round(aPos / sr * 1e6), data });
         aenc.encode(ad); ad.close(); aPos += n;
+        if (aenc.encodeQueueSize > 60) await new Promise(r => setTimeout(r, 0));
       }
     };
 
@@ -1681,7 +1857,6 @@ async function fastExport(opts){
         (speed > 0.3 && done > 60 ? ' · about ' + fmt(Math.max(0, (dur - t) / speed)).replace(/\.\d+$/, '') + ' left' : '') + '.');
     };
     const seg = Math.ceil(F / K);
-    if (K > 1) encodeAudioUntil(dur + 1);   // audio is quick; encode it all up front
     for (let i = 0; i < seg; i++){
       if (job.cancel) break;
       if (encErr) throw encErr;
@@ -1705,15 +1880,16 @@ async function fastExport(opts){
           queue.push({ f, p: raw ? (img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(sizeSvg(raw)), img.decode().then(() => img)) : Promise.resolve(null) });
           if (queue.length >= 4) await drawQueued();
         }
-        if (K === 1) encodeAudioUntil((f + 1) / fps);
+        if (K === 1) await encodeAudioUntil((f + 1) / fps);
         while (vencs[k].encodeQueueSize > 12) await new Promise(r => { wakes[k] = r; setTimeout(r, 50); });
       }
+      if (K > 1) await encodeAudioUntil(dur * (i + 1) / seg);   // keep the audio moving along with the sections
       while (aenc.encodeQueueSize > 60) await new Promise(r => setTimeout(r, 0));
       if (i % 30 === 0){ report(i); await new Promise(r => setTimeout(r, 0)); }
     }
     while (queue.length) await drawQueued();
-    if (job.cancel){ try { vencs.forEach(e => e.close()); aenc.close(); } catch(e){} stopClock(false); setStatus('Export cancelled.'); return; }
-    encodeAudioUntil(dur + 1);
+    if (job.cancel){ try { vencs.forEach(e => e.close()); aenc.close(); } catch(e){} await dropFile(); stopClock(false); setStatus('Export cancelled.'); return; }
+    await encodeAudioUntil(dur + 1);
     setStatus('Finishing the video file…');
     await Promise.all(vencs.map(e => e.flush())); await aenc.flush();
     if (encErr) throw encErr;
@@ -1735,7 +1911,8 @@ async function fastExport(opts){
       if (!stores.every(st => sameBytes(st.desc, stores[0].desc))){
         fastJob = null; setRecUI(false);
         setStatus('Re-exporting with a single encoder…');
-        return fastExport({ single: true, t0: clock && clock.t0 });
+        await dropFile();
+        return fastExport({ single: true, t0: clock && clock.t0, fileHandle: opts.fileHandle });
       }
       let ai = 0, firstV = true;
       for (const st of stores){
@@ -1747,24 +1924,27 @@ async function fastExport(opts){
       while (ai < audioOut.length){ muxer.addAudioChunk(audioOut[ai].c, audioOut[ai].m); ai++; }
     }
     muxer.finalize();
+    if (writable){ setStatus('Saving the video file…'); const w = writable; writable = null; await w.close(); }
     if (big && pend.length) parts.push(new Blob(pend));
-    const blob = big ? new Blob(parts, { type: 'video/mp4' }) : new Blob([target.buffer], { type: 'video/mp4' });
+    const blob = opts.fileHandle ? null : big ? new Blob(parts, { type: 'video/mp4' }) : new Blob([target.buffer], { type: 'video/mp4' });
     const secs = (performance.now() - started) / 1000;
     const base = track.name.replace(/\.[^.]+$/, '').replace(/[^\w\- ]+/g, '').trim() || 'audio';
     fastJob = null; setRecUI(false);
     if (live) live.ifr.contentWindow.postMessage({ type: 'resume' }, '*');
     setStatus('Exported in ' + fmt(secs).replace(/\.\d+$/, '') + ' on the ' + encUsed + (K > 1 ? ' with ' + K + ' encoders' : '') + ' (' + (dur / secs).toFixed(1) + '× faster than real time).');
     stopClock(true, 'Fast export on the ' + encUsed + (K > 1 ? ' with ' + K + ' encoders' : ''));
-    await offerFile(blob, exportName(base, 'mp4'));
+    if (blob) await offerFile(blob, exportName(base, 'mp4'));
+    else setStatus('Saved ' + opts.fileHandle.name + ' (exported in ' + fmtDur(secs) + ', ' + (dur / secs).toFixed(1) + '× faster than real time).');
   } catch (e) {
     console.error(e);
     try { vencs.forEach(v => v.state !== 'closed' && v.close()); aenc && aenc.state !== 'closed' && aenc.close(); } catch(err){}
+    await dropFile();
     fastJob = null; setRecUI(false);
     if (live) live.ifr.contentWindow.postMessage({ type: 'resume' }, '*');
     if (e && e.stillOutput && !opts.software){
       setStatus('The video came out as a still picture (' + e.message + '). Redoing the export on the processor…');
       const keep = clock && clock.t0;
-      setTimeout(() => fastExport({ software: true, single: true, t0: keep }), 600);
+      setTimeout(() => fastExport({ software: true, single: true, t0: keep, fileHandle: opts.fileHandle }), 600);
       return;
     }
     setStatus((e && (e.stillOutput || e.stillSource) ? 'The video came out as a still picture (' + e.message + ').' : 'Fast export stopped (' + ((e && (e.message || e.name)) || 'unknown error') + ').') + ' Starting the regular export instead…');
@@ -1775,7 +1955,24 @@ async function fastExport(opts){
     if (fastJob === job){ fastJob = null; setRecUI(false); if (live) live.ifr.contentWindow.postMessage({ type: 'resume' }, '*'); }
   }
 }
-$('exportBtn').addEventListener('click', () => (canFast && $('fastExport').checked) ? fastExport({}) : exportVideo(0));
+// Long videos are written straight into a file you choose, so they never have to fit in memory.
+const SAVE_DIRECT_AFTER = window.__saveDirectAfter || 20*60;
+$('exportBtn').addEventListener('click', async () => {
+  if (!track || recording) return;
+  if (!(canFast && $('fastExport').checked)) return exportVideo(0);
+  let fileHandle = null;
+  if (track.duration > SAVE_DIRECT_AFTER && window.showSaveFilePicker && window.top === window){
+    const base = track.name.replace(/\.[^.]+$/, '').replace(/[^\w\- ]+/g, '').trim() || 'audio';
+    try {
+      fileHandle = await window.showSaveFilePicker({ suggestedName: exportName(base, 'mp4'), startIn: 'videos',
+        types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }] });
+    } catch (e) {
+      if (e && e.name === 'AbortError'){ setStatus('Export cancelled. Choose where to save the video to start it.'); return; }
+      fileHandle = null;
+    }
+  }
+  fastExport({ fileHandle });
+});
 $('cancelBtn').addEventListener('click', () => { if (fastJob) fastJob.cancel = true; });
 if (!canFast){ $('fastRow').hidden = true; $('encRow').hidden = true; }
 $('fastExport').addEventListener('change', () => { $('encRow').hidden = !canFast || !$('fastExport').checked; });
@@ -1796,10 +1993,32 @@ function gpuName(){
   const name = gpuName();
   let hw = false;
   try { hw = (await VideoEncoder.isConfigSupported({ codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 5e6, framerate: 30, hardwareAcceleration: 'prefer-hardware' })).supported; } catch(e){}
-  $('gpuInfo').textContent = (name ? 'Your browser is using: ' + name + '. ' : '') +
-    (hw ? 'Its video encoder is available.' : 'No graphics-card video encoder was found, so the processor will be used.') +
-    (/Electron/.test(navigator.userAgent) ? ' The desktop app asks Windows for your high-performance graphics card.'
-      : ' Browsers choose the graphics card themselves; on Windows you can switch it in Settings › System › Display › Graphics.');
+  const box = $('gpuInfo'), app = /Electron/.test(navigator.userAgent);
+  const basic = /Basic Render/i.test(name), soft = basic || /SwiftShader|llvmpipe|softpipe|Software/i.test(name);
+  box.textContent = '';
+  const line = (tag, text) => { const el = document.createElement(tag); el.textContent = text; box.appendChild(el); return el; };
+  if (soft){
+    // no graphics card in use: say why, and how to fix it
+    box.classList.add('warn');
+    line('b', 'No graphics card in use, so exports are slower');
+    line('span', 'Your ' + (app ? 'computer' : 'browser') + ' is drawing with "' + name + '", a software stand-in for a graphics card. Exports still work, on the processor.');
+    const ol = document.createElement('ol'); box.appendChild(ol);
+    const steps = basic ? [
+      'If you use Remote Desktop or a virtual machine, run Animator directly on the computer instead. Remote sessions usually have no graphics card.',
+      'Otherwise Windows is missing its graphics driver: open Device Manager › Display adapters. If it says "Microsoft Basic Display Adapter", install the driver from your PC maker or from NVIDIA, AMD or Intel.',
+      'Restart, then reopen Animator. This line should show your graphics card.'
+    ] : [
+      'Open your browser\'s Settings › System and turn on "Use graphics acceleration when available", then relaunch it.',
+      'If it is already on, update your graphics driver from your PC maker or from NVIDIA, AMD or Intel.'
+    ];
+    steps.forEach(t => { const li = document.createElement('li'); li.textContent = t; ol.appendChild(li); });
+  } else {
+    box.classList.remove('warn');
+    line('span', (name ? 'Your ' + (app ? 'computer' : 'browser') + ' is using: ' + name + '. ' : '') +
+      (hw ? 'Its video encoder is available.' : 'No graphics-card video encoder was found, so the processor will be used.') +
+      (app ? ' The desktop app asks Windows for your high-performance graphics card.'
+           : ' Browsers choose the graphics card themselves; on Windows you can switch it in Settings › System › Display › Graphics.'));
+  }
 })();
 $('cancelBtn').addEventListener('click', () => { cancelled = true; audio.pause(); if (rec && rec.state === 'recording') rec.stop(); });
 
